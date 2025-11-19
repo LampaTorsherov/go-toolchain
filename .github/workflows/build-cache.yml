@@ -1,0 +1,52 @@
+name: Build Go module cache
+
+on:
+ workflow_dispatch:
+   inputs:
+     branch: 
+       description: "Branch to checkout"
+       required: true
+       default: "main"
+       type: string
+     go-version:
+       description: "Go version to use"
+       required: true
+       default: "1.25.4"
+       type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+      
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with: 
+          go-version: ${{ github.event.inputs.go-version }}
+
+      - name: Show Go version
+        run: |
+          echo "Using Go version:"
+          go version
+
+      - name: Download modules
+        run: |
+          go mod tidy
+          go mod download -x
+
+      - name: Pack module cache
+        run: |
+          MODCACHE="$(go env GOMODCACHE)"
+          echo "Module cache located at: $MODCACHE"
+          tar -czf "module-cache-${{ github.event.inputs.go-version }}.tar.gz" "$MODCACHE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-cache-${{ github.event.inputs.branch }}-go${{ github.event.inputs.go-version }}.tar.gz
+          path: module-cache-${{ github.event.inputs.go-version }}.tar.gz
+  
