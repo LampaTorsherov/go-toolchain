@@ -43,7 +43,8 @@ jobs:
           MODCACHE="$(go env GOMODCACHE)"
           echo "Module cache located at: $MODCACHE"
           cd "$MODCACHE/.."
-          zip -r "module-cache-${{ github.event.inputs.go-version }}.zip" "mod"
+          zip -qr "module-cache-${{ github.event.inputs.go-version }}.zip" "mod"
+          mv "module-cache-${{ github.event.inputs.go-version }}.zip" $GITHUB_WORKSPACE/
 
       - name: Upload ZIP artifact
         uses: actions/upload-artifact@v4
