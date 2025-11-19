@@ -35,6 +35,8 @@ jobs:
 
       - name: Download modules
         run: |
+          pwd
+          cat go.mod
           go mod tidy
           go mod download -x
 
