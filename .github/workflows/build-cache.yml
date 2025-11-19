@@ -38,17 +38,13 @@ jobs:
           go mod tidy
           go mod download -x
 
-      - name: Pack module cache into ZIP
+      - name: Find module cache path
         run: |
-          MODCACHE="$(go env GOMODCACHE)"
-          echo "Module cache located at: $MODCACHE"
-          cd "$MODCACHE/.."
-          zip -qr "module-cache-${{ github.event.inputs.go-version }}.zip" "mod"
-          mv "module-cache-${{ github.event.inputs.go-version }}.zip" $GITHUB_WORKSPACE/
+          echo "gomodcache=$(go env GOMODCACHE)" >> $GITHUB_OUTPUT
 
-      - name: Upload ZIP artifact
+      - name: Upload module cache directory
         uses: actions/upload-artifact@v4
         with:
           name: module-cache-${{ github.event.inputs.branch }}-go${{ github.event.inputs.go-version }}.zip
-          path: module-cache-${{ github.event.inputs.go-version }}.zip
+          path: ${{ steps.paths.outputs.gomodcache }}
   
