@@ -39,12 +39,13 @@ jobs:
           go mod download -x
 
       - name: Find module cache path
+        id: lookup
         run: |
-          echo "gomodcache=$(go env GOMODCACHE)" >> $GITHUB_OUTPUT
+          echo "GOMODCACHE=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
 
       - name: Upload module cache directory
         uses: actions/upload-artifact@v4
         with:
           name: module-cache-${{ github.event.inputs.branch }}-go${{ github.event.inputs.go-version }}.zip
-          path: ${{ steps.paths.outputs.gomodcache }}
+          path: ${{ steps.lookup.outputs.GOMODCACHE }}
   
