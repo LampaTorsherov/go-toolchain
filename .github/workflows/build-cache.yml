@@ -48,4 +48,5 @@ jobs:
         with:
           name: module-cache-${{ github.event.inputs.branch }}-go${{ github.event.inputs.go-version }}
           path: ${{ steps.lookup.outputs.GOMODCACHE }}
+          retention-days: 1
   
