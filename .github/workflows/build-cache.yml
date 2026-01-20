@@ -1,42 +1,56 @@
 name: Build Go module cache
 
 on:
- workflow_dispatch:
-   inputs:
-     branch: 
-       description: "Branch to checkout"
-       required: true
-       default: "main"
-       type: string
-     go-version:
-       description: "Go version to use"
-       required: true
-       default: "1.25.4"
-       type: string
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to checkout"
+        required: true
+        default: "main"
+        type: string
+      go-version:
+        description: "Go version to use"
+        required: true
+        default: "1.25.4"
+        type: string
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
+    env:
+      GOPROXY: https://proxy.golang.org,direct
+      GOSUMDB: sum.golang.org
+      GOFLAGS: -mod=mod
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.branch }}
-      
+
       - name: Setup Go
         uses: actions/setup-go@v5
-        with: 
+        with:
           go-version: ${{ github.event.inputs.go-version }}
 
-      - name: Show Go version
+      - name: Show Go version and env
         run: |
-          echo "Using Go version:"
           go version
+          go env GOPROXY
+          go env GOMODCACHE
 
-      - name: Download modules
+      - name: Normalize go.mod / go.sum
         run: |
           go mod tidy
-          go mod download -x
+
+      - name: Download all modules
+        run: |
+          go mod download -x all
+
+      - name: Force full dependency resolution
+        run: |
+          go list -deps -test ./... > /dev/null
 
       - name: Find module cache path
         id: lookup
@@ -49,4 +63,3 @@ jobs:
           name: module-cache-${{ github.event.inputs.branch }}-go${{ github.event.inputs.go-version }}
           path: ${{ steps.lookup.outputs.GOMODCACHE }}
           retention-days: 1
-  
