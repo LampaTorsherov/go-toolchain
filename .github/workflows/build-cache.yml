@@ -52,16 +52,16 @@ jobs:
       - name: Force full dependency resolution
         run: |
           go list -deps -test
-		  
-      - name: Deep Recursive Download
+
+      - name: Deep Recursive Download (5 Rounds)
         run: |
           MODCACHE=$(go env GOMODCACHE)/cache/download
-          
+
           echo "Step 0: Initializing with current tree..."
           go mod download -x all
-          
+
           touch previous_deps.txt
-          
+
           for i in {1..5}; do
             echo "--- Iteration $i: Scanning $MODCACHE ---"
             
