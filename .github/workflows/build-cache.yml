@@ -47,12 +47,10 @@ jobs:
       - name: Download all modules
         run: |
           go mod download -x all
-          go get -d ./...
 
       - name: Force full dependency resolution
         run: |
           go list -deps -test ./... > /dev/null
-          go list -f '{{ join .Deps "\n" }}'
 
 
       - name: Find module cache path
