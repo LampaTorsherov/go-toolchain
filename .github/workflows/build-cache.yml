@@ -52,12 +52,40 @@ jobs:
       - name: Force full dependency resolution
         run: |
           go list -deps -test
+		  
+	    - name: Deep Recursive Download
+        run: |
+          MODCACHE=$(go env GOMODCACHE)/cache/download
+          
+          echo "Step 0: Initializing with current tree..."
+          go mod download -x all
+          
+          touch previous_deps.txt
+          
+          for i in {1..5}; do
+            echo "--- Iteration $i: Scanning $MODCACHE ---"
+            
+            grep -rhE '^\s*([^\s]+)\s+(v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z\.]+)?).*$' "$MODCACHE" --include="*.mod" 2>/dev/null | \
+            awk '{print $1"@"$2}' | sort -u > current_deps.txt
+            
+            if diff previous_deps.txt current_deps.txt > /dev/null; then
+              echo "No new dependencies found in this round. Tree is fully resolved."
+              break
+            fi
+            
+            NEW_COUNT=$(comm -13 previous_deps.txt current_deps.txt | wc -l)
+            echo "Found $NEW_COUNT new dependency mentions. Downloading..."
+            
+            comm -13 previous_deps.txt current_deps.txt | xargs -n 1 -P 12 go mod download -x || true
+            
+            cp current_deps.txt previous_deps.txt
+          done
 
 
       - name: Find module cache path
         id: lookup
         run: |
-          echo "GOMODCACHE=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+          echo "GOMODCACHE=$(go env GOMODCACHE)/cache/download" >> "$GITHUB_OUTPUT"
 
       - name: Upload module cache directory
         uses: actions/upload-artifact@v4
