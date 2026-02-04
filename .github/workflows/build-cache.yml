@@ -51,7 +51,7 @@ jobs:
 
       - name: Force full dependency resolution
         run: |
-          go list -deps -test ./... > /dev/null
+          go list -deps -test -m all > /dev/null
 
 
       - name: Find module cache path
