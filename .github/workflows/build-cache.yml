@@ -47,6 +47,7 @@ jobs:
       - name: Download all modules
         run: |
           go mod download -x all
+          go mod vendor
 
       - name: Force full dependency resolution
         run: |
