@@ -53,7 +53,7 @@ jobs:
         run: |
           go list -deps -test
 		  
-	    - name: Deep Recursive Download
+      - name: Deep Recursive Download
         run: |
           MODCACHE=$(go env GOMODCACHE)/cache/download
           
@@ -80,7 +80,6 @@ jobs:
             
             cp current_deps.txt previous_deps.txt
           done
-
 
       - name: Find module cache path
         id: lookup
