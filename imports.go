@@ -1,7 +1,7 @@
-//go:build tools
-// +build tools
-package imports
+package main
 
 import (
   
 )
+
+func main() {}
