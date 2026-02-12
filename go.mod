@@ -3,5 +3,5 @@ module offline-cache
 go 1.25
 
 require (
-  maragu.dev/goqite v0.4.0
+  github.com/stretchr/objx v0.5.2
 )
