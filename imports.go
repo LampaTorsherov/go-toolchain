@@ -1,7 +1,7 @@
 package main
 
 import (
-  _ "maragu.dev/goqite"
+  _ "github.com/stretchr/objx"
 )
 
 func main() {}
