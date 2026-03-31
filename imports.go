@@ -1,7 +1,7 @@
 package main
 
 import (
-  _ "github.com/patrickmn/go-cache"
+  _ "github.com/jellydator/ttlcache/v3"
 )
 
 func main() {}
