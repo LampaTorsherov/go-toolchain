@@ -49,9 +49,9 @@ jobs:
           go mod download -x all
           go mod vendor
 
-      - name: Force full dependency resolution
-        run: |
-          go list -deps -test
+      #- name: Force full dependency resolution
+      #  run: |
+      #    go list -deps -test
 
       - name: Nuclear Dependency Download
         run: |
