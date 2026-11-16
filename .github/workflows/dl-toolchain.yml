@@ -1,4 +1,3 @@
-
 name: Export Go toolchain module cache for Athens
 
 on:
