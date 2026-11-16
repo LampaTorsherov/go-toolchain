@@ -1,0 +1,476 @@
+
+name: Export Go toolchain module cache for Athens
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_ver:
+        description: "First Go minor version (e.g. 1.21)"
+        required: true
+        type: string
+        default: "1.21"
+
+      end_ver:
+        description: "Last Go minor version (e.g. 1.27)"
+        required: true
+        type: string
+        default: "1.27"
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    permissions:
+      contents: read
+
+    env:
+      START_VER: ${{ inputs.start_ver }}
+      END_VER: ${{ inputs.end_ver }}
+
+      # Official Go module proxy and checksum database.
+      GOPROXY: https://proxy.golang.org
+      GOSUMDB: sum.golang.org
+
+      # Never switch the runner's Go toolchain
+      # automatically while exporting modules.
+      GOTOOLCHAIN: local
+
+      GO111MODULE: "on"
+      GOWORK: "off"
+
+      # Separate cache, independent of repository content
+      # and unrelated packages preinstalled on the runner.
+      GOMODCACHE: ${{ runner.temp }}/toolchain-modcache
+
+    steps:
+      # ------------------------------------------------
+      # 1. Install Go
+      # ------------------------------------------------
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: false
+
+      # ------------------------------------------------
+      # 2. Resolve final stable patch versions
+      # ------------------------------------------------
+
+      - name: Resolve latest stable patch for each Go minor
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          from urllib.request import urlopen
+
+          def minor_number(value, key):
+              match = re.fullmatch(r"1\.(\d+)", value)
+
+              if not match:
+                  raise SystemExit(
+                      f"{key} must look like 1.21 "
+                      f"(got {value!r})"
+                  )
+
+              result = int(match.group(1))
+
+              if result < 21:
+                  raise SystemExit(
+                      f"{key}: Go toolchain auto-download "
+                      f"begins at Go 1.21"
+                  )
+
+              return result
+
+          start = minor_number(
+              os.environ["START_VER"],
+              "start_ver"
+          )
+
+          end = minor_number(
+              os.environ["END_VER"],
+              "end_ver"
+          )
+
+          if start > end:
+              raise SystemExit(
+                  "start_ver must not exceed end_ver"
+              )
+
+          # Official module version list.
+          #
+          # The upstream list is NOT sorted.
+          # Therefore, never take the last matching line.
+          url = (
+              "https://proxy.golang.org/"
+              "golang.org/toolchain/@v/list"
+          )
+
+          print(f"Reading {url}", flush=True)
+
+          with urlopen(url, timeout=60) as response:
+              lines = (
+                  response.read()
+                  .decode("utf-8")
+                  .splitlines()
+              )
+
+          # Only stable patch releases:
+          #
+          # v0.0.1-go1.21.13.linux-amd64
+          # v0.0.1-go1.21.13.windows-amd64
+          #
+          # Excludes:
+          # - rc/beta versions
+          # - arm64 and other architectures
+          # - other operating systems
+          pattern = re.compile(
+              r"v0\.0\.1-go1\.(\d+)\.(\d+)"
+              r"\.(linux|windows)-amd64"
+          )
+
+          patches = {}
+
+          for line in lines:
+              match = pattern.fullmatch(line.strip())
+
+              if not match:
+                  continue
+
+              minor, patch, os_name = match.groups()
+
+              patches.setdefault(
+                  (int(minor), os_name),
+                  set()
+              ).add(int(patch))
+
+          chosen = []
+
+          for minor in range(start, end + 1):
+              linux = patches.get(
+                  (minor, "linux"),
+                  set()
+              )
+
+              windows = patches.get(
+                  (minor, "windows"),
+                  set()
+              )
+
+              if not linux or not windows:
+                  raise SystemExit(
+                      f"Missing releases for Go 1.{minor}: "
+                      f"linux={bool(linux)} "
+                      f"windows={bool(windows)}"
+                  )
+
+              latest_linux = max(linux)
+              latest_windows = max(windows)
+
+              # Both OS variants must exist for the
+              # same newest Go patch version.
+              #
+              # Never silently fall back to an older
+              # patch if one platform is missing.
+              if latest_linux != latest_windows:
+                  raise SystemExit(
+                      f"Go 1.{minor} has mismatched "
+                      f"newest patches: "
+                      f"linux={latest_linux}, "
+                      f"windows={latest_windows}"
+                  )
+
+              for os_name in ("linux", "windows"):
+                  version = (
+                      f"v0.0.1-go1.{minor}."
+                      f"{latest_linux}.{os_name}-amd64"
+                  )
+
+                  chosen.append(version)
+                  print("SELECT:", version)
+
+          out = (
+              Path(os.environ["RUNNER_TEMP"])
+              / "selected-versions.txt"
+          )
+
+          out.write_text(
+              "\n".join(chosen) + "\n",
+              encoding="utf-8"
+          )
+
+          print(
+              f"Selected {len(chosen)} "
+              f"toolchain modules"
+          )
+          PY
+
+      # ------------------------------------------------
+      # 3. Download through the official Go client
+      # ------------------------------------------------
+
+      - name: Download and verify module versions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          go version
+          go env GOPROXY GOSUMDB GOMODCACHE GOTOOLCHAIN
+
+          python3 - <<'PY'
+          import concurrent.futures
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          versions = (
+              Path(os.environ["RUNNER_TEMP"])
+              / "selected-versions.txt"
+          ).read_text(
+              encoding="utf-8"
+          ).splitlines()
+
+          def download(version):
+              module = f"golang.org/toolchain@{version}"
+
+              # Go itself downloads the .info, .mod,
+              # .zip and generates the .ziphash.
+              #
+              # Checksums are verified through GOSUMDB.
+              cmd = [
+                  "go",
+                  "mod",
+                  "download",
+                  "-json",
+                  module,
+              ]
+
+              run = subprocess.run(
+                  cmd,
+                  cwd=os.environ["RUNNER_TEMP"],
+                  capture_output=True,
+                  text=True,
+                  check=False,
+              )
+
+              if run.returncode:
+                  raise RuntimeError(
+                      f"{version}: "
+                      f"exit {run.returncode}\n"
+                      f"{run.stdout}\n"
+                      f"{run.stderr}"
+                  )
+
+              result = json.loads(run.stdout)
+
+              if result.get("Error"):
+                  raise RuntimeError(
+                      f"{version}: {result['Error']}"
+                  )
+
+              if (
+                  result.get("Path"),
+                  result.get("Version")
+              ) != (
+                  "golang.org/toolchain",
+                  version
+              ):
+                  raise RuntimeError(
+                      f"{version}: unexpected "
+                      f"Go response: {result}"
+                  )
+
+              return version
+
+          errors = []
+
+          # Parallel downloads. The Go module cache
+          # supports concurrent access.
+          #
+          # Limit to 3 workers because toolchain
+          # archives are much larger than ordinary
+          # Go modules.
+          with concurrent.futures.ThreadPoolExecutor(
+              max_workers=3
+          ) as pool:
+
+              futures = {
+                  pool.submit(download, version): version
+                  for version in versions
+              }
+
+              for future in concurrent.futures.as_completed(
+                  futures
+              ):
+                  try:
+                      print(
+                          "OK:",
+                          future.result(),
+                          flush=True
+                      )
+                  except Exception as exc:
+                      errors.append(str(exc))
+                      print(
+                          "ERROR:",
+                          exc,
+                          flush=True
+                      )
+
+          # Fail the job if even one version failed.
+          # Never upload an incomplete transfer archive.
+          if errors:
+              raise SystemExit(
+                  "Module download failed; "
+                  "no archive will be uploaded"
+              )
+          PY
+
+      # ------------------------------------------------
+      # 4. Extract only the Go proxy cache layout
+      # ------------------------------------------------
+
+      - name: Package Go module cache
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+
+          temp = Path(os.environ["RUNNER_TEMP"])
+
+          versions = (
+              temp / "selected-versions.txt"
+          ).read_text(
+              encoding="utf-8"
+          ).splitlines()
+
+          # Actual Go module download cache.
+          source = (
+              Path(os.environ["GOMODCACHE"])
+              / "cache/download/golang.org/toolchain/@v"
+          )
+
+          # The archive must start with:
+          #
+          # golang.org/toolchain/@v/
+          #
+          # NOT pkg/mod/cache/download/
+          #
+          # It will be extracted directly into the
+          # directory used as the Athens file store.
+          destination = (
+              temp
+              / "athens-staging/golang.org/toolchain/@v"
+          )
+
+          destination.mkdir(
+              parents=True,
+              exist_ok=True
+          )
+
+          for version in versions:
+              for extension in (
+                  ".info",
+                  ".mod",
+                  ".zip",
+                  ".ziphash",
+              ):
+                  filename = version + extension
+
+                  source_file = source / filename
+
+                  if (
+                      not source_file.is_file()
+                      or source_file.stat().st_size == 0
+                  ):
+                      raise SystemExit(
+                          "Missing or empty module "
+                          f"cache file: {source_file}"
+                      )
+
+                  shutil.copy2(
+                      source_file,
+                      destination / filename
+                  )
+
+              # Verify metadata version.
+              info = json.loads(
+                  (
+                      destination
+                      / (version + ".info")
+                  ).read_text()
+              )
+
+              if info.get("Version") != version:
+                  raise SystemExit(
+                      f"Version mismatch in {version}.info"
+                  )
+
+              # Go-generated ZIP checksum.
+              ziphash = (
+                  destination
+                  / (version + ".ziphash")
+              ).read_text().strip()
+
+              if not ziphash.startswith("h1:"):
+                  raise SystemExit(
+                      f"Invalid Go ziphash for {version}"
+                  )
+
+          print(
+              f"Staged {len(versions)} modules "
+              f"({len(versions) * 4} files)"
+          )
+          PY
+
+          # Uncompressed TAR:
+          #
+          # The underlying Go module ZIPs are already
+          # compressed; another compression pass
+          # wastes CPU and usually saves little space.
+          mkdir -p dist
+
+          tar -cf dist/go-toolchains-cache.tar \
+            -C "$RUNNER_TEMP/athens-staging" \
+            golang.org
+
+          cp \
+            "$RUNNER_TEMP/selected-versions.txt" \
+            dist/selected-versions.txt
+
+          (
+            cd dist
+            sha256sum go-toolchains-cache.tar \
+              > SHA256SUMS
+          )
+
+          ls -lh dist/
+
+      # ------------------------------------------------
+      # 5. Publish the offline transfer package
+      # ------------------------------------------------
+
+      - name: Upload Athens transfer archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: athens-go-toolchains-${{ inputs.start_ver }}-to-${{ inputs.end_ver }}-amd64
+          path: |
+            dist/go-toolchains-cache.tar
+            dist/selected-versions.txt
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+          # TAR contains ZIP archives already.
+          compression-level: 0
+          retention-days: 1
