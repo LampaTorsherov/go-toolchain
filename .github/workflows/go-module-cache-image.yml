@@ -1,0 +1,129 @@
+name: Build Go module cache (scratch image)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to checkout"
+        required: true
+        default: "main"
+        type: string
+      go-version:
+        description: "Go version to use"
+        required: true
+        default: "1.27.4"
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      GOPROXY: https://proxy.golang.org,direct
+      GOSUMDB: sum.golang.org
+      GOFLAGS: -mod=mod
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+
+      - name: Show Go version and env
+        run: |
+          go version
+          go env GOPROXY
+          go env GOMODCACHE
+
+      - name: Download all modules
+        run: |
+          go mod download -x all && go mod vendor || { echo "Warn: download failed"; true; }
+
+      # As in the original workflow: pull every module version in the graph,
+      # then scan downloaded go.mod files twice for deeper dependencies.
+      - name: Nuclear Dependency Download
+        shell: bash
+        run: |
+          go mod graph > full_graph.txt
+          awk '{print $2}' full_graph.txt | grep '@' | sort -u > all_possible_deps.txt
+          echo "Found $(wc -l < all_possible_deps.txt) unique dependency versions in graph."
+          xargs -r -n 1 -P 12 go mod download -x < all_possible_deps.txt || true
+
+          MODCACHE="$(go env GOMODCACHE)/cache/download"
+          for i in 1 2; do
+            grep -rhE '^[[:space:]]*[^[:space:]]+[[:space:]]+v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.]+)?' \
+              --include='*.mod' "$MODCACHE" 2>/dev/null | \
+              awk '{print $1 "@" $2}' | sort -u > recursive_deps.txt || true
+            echo "Pass $i: found $(wc -l < recursive_deps.txt) module versions."
+            xargs -r -n 1 -P 12 go mod download -x < recursive_deps.txt || true
+          done
+
+      - name: Build and push scratch image to GHCR
+        id: publish
+        shell: bash
+        env:
+          BRANCH: ${{ inputs.branch }}
+          REQUESTED_GO_VERSION: ${{ inputs.go-version }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # The Docker build context is the parent of cache/download.
+          # This avoids copying the complete cache to a second staging folder.
+          CACHE_DIR="$(go env GOMODCACHE)/cache/download"
+          CACHE_CONTEXT="$(dirname "$CACHE_DIR")"
+          test -d "$CACHE_DIR"
+
+          ZIP_COUNT="$(find "$CACHE_DIR" -type f -name '*.zip' | wc -l)"
+          echo "Downloaded ZIP modules: $ZIP_COUNT"
+          du -sh "$CACHE_DIR"
+          if [ "$ZIP_COUNT" -eq 0 ]; then
+            echo 'ERROR: The module download cache contains no ZIP files.' >&2
+            exit 1
+          fi
+
+          # Docker repository names must be lowercase; tags are unique per run.
+          REPO="${GITHUB_REPOSITORY,,}"
+          BRANCH_TAG="$(printf '%s' "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_.-]+/-/g' | cut -c1-40)"
+          GO_TAG="$(printf '%s' "$REQUESTED_GO_VERSION" | sed -E 's/[^A-Za-z0-9_.-]+/-/g' | cut -c1-20)"
+          IMAGE="ghcr.io/${REPO}:modcache-${BRANCH_TAG}-go${GO_TAG}-run${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          # There is no OS, shell, Go binary, CMD, or ENTRYPOINT in the image.
+          # Provide a fake command when calling `docker create` to copy files.
+          DOCKERFILE="$RUNNER_TEMP/Dockerfile.go-module-cache"
+          cat > "$DOCKERFILE" <<'EOF'
+          FROM scratch
+          COPY download/ /cache/download/
+          EOF
+
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build \
+            --platform linux/amd64 \
+            --file "$DOCKERFILE" \
+            --tag "$IMAGE" \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            "$CACHE_CONTEXT"
+          docker push "$IMAGE"
+
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Published: $IMAGE"
+
+      - name: Show result in workflow summary
+        env:
+          IMAGE: ${{ steps.publish.outputs.image }}
+        run: |
+          {
+            echo '### Published scratch image'
+            echo "\`$IMAGE\`"
+            echo ''
+            echo 'Contains `/cache/download/` (raw Go module proxy cache).'
+          } >> "$GITHUB_STEP_SUMMARY"
