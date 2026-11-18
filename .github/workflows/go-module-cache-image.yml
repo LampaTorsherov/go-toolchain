@@ -1,4 +1,4 @@
-name: Build Go module cache (scratch image)
+name: Build Go module cache (layered scratch image)
 
 on:
   workflow_dispatch:
@@ -26,6 +26,10 @@ jobs:
       GOPROXY: https://proxy.golang.org,direct
       GOSUMDB: sum.golang.org
       GOFLAGS: -mod=mod
+      # Upper bound of raw data in each Docker layer (MiB).
+      # Each module is kept whole if it fits; large multi-version
+      # modules are split ONLY between versions, never inside a version.
+      LAYER_TARGET_MIB: "1024"
 
     steps:
       - name: Checkout repo
@@ -45,11 +49,13 @@ jobs:
           go env GOMODCACHE
 
       - name: Download all modules
+        shell: bash
         run: |
-          go mod download -x all && go mod vendor || { echo "Warn: download failed"; true; }
+          go mod download -x all && go mod vendor || {
+            echo "Warn: download or vendor failed; proceeding with available cache"
+            true
+          }
 
-      # As in the original workflow: pull every module version in the graph,
-      # then scan downloaded go.mod files twice for deeper dependencies.
       - name: Nuclear Dependency Download
         shell: bash
         run: |
@@ -67,63 +73,214 @@ jobs:
             xargs -r -n 1 -P 12 go mod download -x < recursive_deps.txt || true
           done
 
-      - name: Build and push scratch image to GHCR
+      - name: Remove sumdb and assemble layer context
+        id: packing
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CACHE_DIR="$(go env GOMODCACHE)/cache/download"
+          BUILD_CONTEXT="$RUNNER_TEMP/go-module-cache-context"
+          rm -rf "$CACHE_DIR/sumdb" "$BUILD_CONTEXT"
+          mkdir -p "$BUILD_CONTEXT"
+
+          ZIP_COUNT="$(find "$CACHE_DIR" -type f -name '*.zip' | wc -l)"
+          if [ "$ZIP_COUNT" -eq 0 ]; then
+            echo "ERROR: cache/download contains no module ZIP files" >&2
+            exit 1
+          fi
+          echo "Module ZIP files: $ZIP_COUNT"
+          du -sh "$CACHE_DIR"
+
+          # Each COPY in the generated Dockerfile creates a separate layer.
+          # Files are hardlinked into the build context when possible, avoiding
+          # an extra full-size copy on the GitHub runner.
+          python3 - "$CACHE_DIR" "$BUILD_CONTEXT" "$LAYER_TARGET_MIB" <<'PY'
+          import collections
+          import errno
+          import os
+          from pathlib import Path
+          import shutil
+          import sys
+
+          src = Path(sys.argv[1])
+          ctx = Path(sys.argv[2])
+          limit = int(sys.argv[3]) * 1024 * 1024
+          if limit <= 0:
+              raise SystemExit("LAYER_TARGET_MIB must be positive")
+
+          # Budget for tar headers, file paths and directory metadata.
+          # The target applies to this conservative size estimate, not
+          # just the sum of file payload sizes.
+          def weight(files):
+              return sum(size + 4096 for _, size in files)
+
+          # Return the module path and version. Metadata such as @v/list
+          # has no version; it stays with the module or in its own unit.
+          version_suffixes = (".ziphash", ".zip", ".mod", ".info", ".lock")
+
+          def module_version(relative):
+              parts = relative.parts
+              if "@v" not in parts:
+                  return relative.parent.as_posix(), None
+              i = parts.index("@v")
+              module = Path(*parts[:i]).as_posix()
+              tail = parts[i + 1:]
+              if len(tail) == 1:
+                  for suffix in version_suffixes:
+                      if tail[0].endswith(suffix) and len(tail[0]) > len(suffix):
+                          return module, tail[0][:-len(suffix)]
+              return module, None
+
+          modules = collections.defaultdict(list)
+          total_files = 0
+          total_bytes = 0
+          for directory, dirs, names in os.walk(src):
+              dirs.sort()
+              for filename in sorted(names):
+                  absolute = Path(directory) / filename
+                  if absolute.is_symlink() or not absolute.is_file():
+                      raise RuntimeError(f"Unexpected non-regular file: {absolute}")
+                  relative = absolute.relative_to(src)
+                  if relative.parts[0] == "sumdb":
+                      raise RuntimeError("sumdb unexpectedly survived removal")
+                  size = absolute.stat().st_size
+                  module, version = module_version(relative)
+                  modules[module].append((relative, size, version))
+                  total_files += 1
+                  total_bytes += size
+
+          if not total_files:
+              raise SystemExit("No module cache files to package")
+
+          units = []
+          oversized_modules = 0
+          for module, entries in sorted(modules.items()):
+              whole = [(path, size) for path, size, _ in entries]
+              if weight(whole) <= limit:
+                  # Prefer keeping ALL versions of a module in one layer.
+                  units.append((module, whole))
+                  continue
+
+              # One module is too big: split ONLY at version boundaries.
+              oversized_modules += 1
+              versions = collections.defaultdict(list)
+              for path, size, version in entries:
+                  key = version if version is not None else "__module_metadata__"
+                  versions[key].append((path, size))
+
+              for version, files in sorted(versions.items()):
+                  if weight(files) > limit:
+                      raise SystemExit(
+                          f"Atomic module/version exceeds layer limit: "
+                          f"{module}@{version} ({weight(files) / 2**20:.1f} MiB). "
+                          f"Cannot split inside a module version; raise LAYER_TARGET_MIB "
+                          f"or handle that module separately."
+                      )
+                  units.append((f"{module}@{version}", files))
+
+          # First-fit decreasing bin packing, constrained by the layer limit.
+          units.sort(key=lambda unit: (-weight(unit[1]), unit[0]))
+          bins = []
+          sizes = []
+          for name, files in units:
+              cost = weight(files)
+              if cost > limit:
+                  raise RuntimeError(f"Internal error: oversized unit {name}")
+              for i, used in enumerate(sizes):
+                  if used + cost <= limit:
+                      bins[i].extend(files)
+                      sizes[i] += cost
+                      break
+              else:
+                  bins.append(list(files))
+                  sizes.append(cost)
+
+          copied_files = 0
+          copied_bytes = 0
+          for i, files in enumerate(bins, 1):
+              part = ctx / f"part-{i:04d}"
+              for relative, size in files:
+                  source = src / relative
+                  dest = part / relative
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  try:
+                      os.link(source, dest)
+                  except OSError as exc:
+                      if exc.errno not in (errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP):
+                          raise
+                      shutil.copy2(source, dest)
+                  copied_files += 1
+                  copied_bytes += size
+
+          if copied_files != total_files or copied_bytes != total_bytes:
+              raise RuntimeError("Packing verification failed: file/byte count mismatch")
+
+          dockerfile = ctx / "Dockerfile"
+          with dockerfile.open("w", encoding="utf-8") as out:
+              out.write("FROM scratch\n")
+              for i in range(1, len(bins) + 1):
+                  out.write(f"COPY part-{i:04d}/ /cache/download/\n")
+
+          (ctx / "layer-count").write_text(str(len(bins)), encoding="ascii")
+          print(f"Modules: {len(modules)}, oversized multi-version modules: {oversized_modules}")
+          print(f"Files: {total_files}, total payload: {total_bytes / 2**30:.2f} GiB")
+          print(f"Docker layers: {len(bins)}; target max: {limit / 2**20:.0f} MiB")
+          for i, files in enumerate(bins, 1):
+              payload = sum(size for _, size in files)
+              print(f"  layer {i:04d}: {len(files):6d} files, {payload / 2**20:9.1f} MiB payload")
+          PY
+
+          echo "context=$BUILD_CONTEXT" >> "$GITHUB_OUTPUT"
+          echo "layers=$(cat "$BUILD_CONTEXT/layer-count")" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push layered scratch image
         id: publish
         shell: bash
         env:
           BRANCH: ${{ inputs.branch }}
           REQUESTED_GO_VERSION: ${{ inputs.go-version }}
+          BUILD_CONTEXT: ${{ steps.packing.outputs.context }}
+          EXPECTED_LAYERS: ${{ steps.packing.outputs.layers }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          # The Docker build context is the parent of cache/download.
-          # This avoids copying the complete cache to a second staging folder.
-          CACHE_DIR="$(go env GOMODCACHE)/cache/download"
-          CACHE_CONTEXT="$(dirname "$CACHE_DIR")"
-          test -d "$CACHE_DIR"
-
-          ZIP_COUNT="$(find "$CACHE_DIR" -type f -name '*.zip' | wc -l)"
-          echo "Downloaded ZIP modules: $ZIP_COUNT"
-          du -sh "$CACHE_DIR"
-          if [ "$ZIP_COUNT" -eq 0 ]; then
-            echo 'ERROR: The module download cache contains no ZIP files.' >&2
-            exit 1
-          fi
-
-          # Docker repository names must be lowercase; tags are unique per run.
           REPO="${GITHUB_REPOSITORY,,}"
           BRANCH_TAG="$(printf '%s' "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_.-]+/-/g' | cut -c1-40)"
           GO_TAG="$(printf '%s' "$REQUESTED_GO_VERSION" | sed -E 's/[^A-Za-z0-9_.-]+/-/g' | cut -c1-20)"
           IMAGE="ghcr.io/${REPO}:modcache-${BRANCH_TAG}-go${GO_TAG}-run${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
-          # There is no OS, shell, Go binary, CMD, or ENTRYPOINT in the image.
-          # Provide a fake command when calling `docker create` to copy files.
-          DOCKERFILE="$RUNNER_TEMP/Dockerfile.go-module-cache"
-          cat > "$DOCKERFILE" <<'EOF'
-          FROM scratch
-          COPY download/ /cache/download/
-          EOF
-
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
           docker build \
             --platform linux/amd64 \
-            --file "$DOCKERFILE" \
+            --file "$BUILD_CONTEXT/Dockerfile" \
             --tag "$IMAGE" \
             --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
-            "$CACHE_CONTEXT"
-          docker push "$IMAGE"
+            "$BUILD_CONTEXT"
 
+          ACTUAL_LAYERS="$(docker image inspect "$IMAGE" --format '{{ len .RootFS.Layers }}')"
+          if [ "$ACTUAL_LAYERS" -ne "$EXPECTED_LAYERS" ]; then
+            echo "ERROR: expected $EXPECTED_LAYERS layers, got $ACTUAL_LAYERS" >&2
+            exit 1
+          fi
+
+          docker push "$IMAGE"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-          echo "Published: $IMAGE"
+          echo "Published $IMAGE ($ACTUAL_LAYERS data layers)"
 
       - name: Show result in workflow summary
         env:
           IMAGE: ${{ steps.publish.outputs.image }}
+          LAYERS: ${{ steps.packing.outputs.layers }}
         run: |
           {
-            echo '### Published scratch image'
+            echo '### Published layered scratch image'
             echo "\`$IMAGE\`"
             echo ''
-            echo 'Contains `/cache/download/` (raw Go module proxy cache).'
+            echo "- Data layers: $LAYERS (up to $LAYER_TARGET_MIB MiB of raw data each)"
+            echo '- Cache location: `/cache/download/`'
+            echo '- `sumdb/` removed before packaging'
+            echo '- All files for each module version stay together'
           } >> "$GITHUB_STEP_SUMMARY"
