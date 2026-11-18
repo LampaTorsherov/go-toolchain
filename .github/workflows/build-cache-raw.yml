@@ -1,0 +1,75 @@
+name: Build Go module cache (raw)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to checkout"
+        required: true
+        default: "main"
+        type: string
+      go-version:
+        description: "Go version to use"
+        required: true
+        default: "1.25.4"
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      GOPROXY: https://proxy.golang.org,direct
+      GOSUMDB: sum.golang.org
+      GOFLAGS: -mod=mod
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ github.event.inputs.go-version }}
+
+      - name: Show Go version and env
+        run: |
+          go version
+          go env GOPROXY
+          go env GOMODCACHE
+
+      - name: Download all modules
+        run: |
+          go mod download -x all
+          go mod vendor
+
+      #- name: Force full dependency resolution
+      #  run: |
+      #    go list -deps -test
+
+      - name: Nuclear Dependency Download
+        run: |
+          go mod graph > full_graph.txt
+          awk '{print $2}' full_graph.txt | grep '@' | sort -u > all_possible_deps.txt
+          echo "Found $(wc -l < all_possible_deps.txt) unique dependency versions in graph."
+          cat all_possible_deps.txt | xargs -n 1 -P 12 go mod download -x || true
+          MODCACHE=$(go env GOMODCACHE)/cache/download
+          for i in {1..2}; do
+            grep -rhE '^\s*([^\s]+)\s+(v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z\.]+)?).*$' "$MODCACHE" --include="*.mod" 2>/dev/null | \
+            awk '{print $1"@"$2}' | sort -u > recursive_deps.txt
+            cat recursive_deps.txt | xargs -n 1 -P 12 go mod download -x || true
+          done
+          
+      - name: Find module cache path
+        id: lookup
+        run: |
+          echo "GOMODCACHE=$(go env GOMODCACHE)/cache/download" >> "$GITHUB_OUTPUT"
+
+      - name: Upload module cache directory
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-cache-${{ github.event.inputs.branch }}-go${{ github.event.inputs.go-version }}
+          path: ${{ steps.lookup.outputs.GOMODCACHE }}
+          retention-days: 1
