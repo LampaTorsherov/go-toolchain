@@ -56,7 +56,7 @@ jobs:
       - name: Download all modules
         shell: bash
         run: |
-          if [[ ${{ inputs.go-tidy }} ]]; then go mod tidy fi
+          ${{ inputs.go-tidy }} && go mod tidy
           go mod download -x all && go mod vendor || {
             echo "Warn: download or vendor failed; proceeding with available cache"
             true
